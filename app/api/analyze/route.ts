@@ -8,6 +8,18 @@ export const maxDuration = 60;
 // Uses Google Gemini's FREE tier (no credit card). Set GEMINI_API_KEY in .env.local.
 const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
 
+// Free-tier quota is counted per model, so falling back to another model buys a
+// fresh allowance. GEMINI_MODEL still picks the primary; GEMINI_MODELS replaces
+// the whole chain (comma-separated, tried in order).
+const MODEL_CHAIN: string[] = (
+  process.env.GEMINI_MODELS
+    ? process.env.GEMINI_MODELS.split(",")
+    : [process.env.GEMINI_MODEL || "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+)
+  .map((m) => m.trim())
+  .filter(Boolean)
+  .filter((m, i, arr) => arr.indexOf(m) === i);
+
 const SYSTEM_PROMPT = `You are a clear-eyed Indian portfolio analyst. A retail investor has given you their mutual fund / stock statement — often a messy Consolidated Account Statement (CAS) from CAMS/KFintech, a broker holding report (Zerodha, Groww, Upstox), or a fund-house statement. Tell them, in plain language, what they ACTUALLY own.
 
 You understand real Indian statement formats:
@@ -79,6 +91,12 @@ function extractQuotaInfo(raw: string): { quotaId?: string; quotaValue?: string;
   };
 }
 
+// Quota/rate failures are the only ones worth retrying on a different model.
+function isQuotaError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /429|RESOURCE_EXHAUSTED|quota|rate.?limit/i.test(msg);
+}
+
 // Turn a Gemini failure into something that names the actual cause.
 function describeGeminiError(err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err);
@@ -139,29 +157,44 @@ export async function POST(req: NextRequest) {
   const stream = new ReadableStream({
     async start(controller) {
       const encoder = new TextEncoder();
-      try {
-        const result = await genAI.models.generateContentStream({
-          // Defaults to the confirmed free-tier model. To try the newer
-          // gemini-3.5-flash (also free), set GEMINI_MODEL in .env.local.
-          model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
-          contents: `Here is my statement:\n\n${trimmed}`,
-          config: {
-            systemInstruction: beginnerMode === true
-              ? SYSTEM_PROMPT + `\n\nIMPORTANT — BEGINNER MODE IS ON: This person is completely new to investing. Write every field as if explaining to a smart friend who has never invested: no financial terms at all without an instant everyday-words explanation, use simple analogies where they help, keep sentences short, and be extra warm and reassuring in tone. Never assume they know what equity, debt, NAV, or allocation mean — always say it in plain everyday words first.`
-              : SYSTEM_PROMPT,
-          },
-        });
+      const systemInstruction = beginnerMode === true
+        ? SYSTEM_PROMPT + `\n\nIMPORTANT — BEGINNER MODE IS ON: This person is completely new to investing. Write every field as if explaining to a smart friend who has never invested: no financial terms at all without an instant everyday-words explanation, use simple analogies where they help, keep sentences short, and be extra warm and reassuring in tone. Never assume they know what equity, debt, NAV, or allocation mean — always say it in plain everyday words first.`
+        : SYSTEM_PROMPT;
 
-        for await (const chunk of result) {
-          const t = chunk.text;
-          if (t) controller.enqueue(encoder.encode(t));
+      // Free-tier quota is per model, so an exhausted model doesn't mean an
+      // exhausted key — try the next one instead of failing the request.
+      let sentAnything = false;
+      let lastErr: unknown = null;
+
+      try {
+        for (const model of MODEL_CHAIN) {
+          try {
+            const result = await genAI.models.generateContentStream({
+              model,
+              contents: `Here is my statement:\n\n${trimmed}`,
+              config: { systemInstruction },
+            });
+
+            for await (const chunk of result) {
+              const t = chunk.text;
+              if (t) { sentAnything = true; controller.enqueue(encoder.encode(t)); }
+            }
+            lastErr = null;
+            break;
+          } catch (err) {
+            lastErr = err;
+            console.error(`Gemini stream error (model ${model}):`, err);
+            // Once bytes are out we can't restart cleanly on another model, and
+            // a non-quota failure won't be fixed by switching. Stop either way.
+            if (sentAnything || !isQuotaError(err)) break;
+            console.error(`Model ${model} out of quota — falling back to the next model.`);
+          }
         }
-      } catch (err) {
-        console.error("Gemini stream error:", err);
-        // Report what actually went wrong. A blanket "rate limit" guess here
-        // hides auth, model-name and quota failures behind the wrong cause.
-        const detail = describeGeminiError(err);
-        controller.enqueue(encoder.encode("\n" + JSON.stringify({ kind: "error", text: detail }) + '\n{"kind":"done"}\n'));
+
+        if (lastErr) {
+          const detail = describeGeminiError(lastErr);
+          controller.enqueue(encoder.encode("\n" + JSON.stringify({ kind: "error", text: detail }) + '\n{"kind":"done"}\n'));
+        }
       } finally {
         controller.close();
       }
