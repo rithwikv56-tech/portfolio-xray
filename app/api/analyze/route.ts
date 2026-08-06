@@ -59,6 +59,31 @@ HARD RULES:
 - If the text is clearly NOT a financial statement: emit the meta line (confidence "low", summary saying so), then {"kind":"done"} with no holdings.
 - Output ONLY the JSON lines, nothing else.`;
 
+// Never echo anything key-shaped back to the browser, whatever the API said.
+function redact(s: string): string {
+  return s.replace(/\b(AQ\.[A-Za-z0-9_-]+|AIza[A-Za-z0-9_-]+)/g, "[redacted]");
+}
+
+// Turn a Gemini failure into something that names the actual cause.
+function describeGeminiError(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  const msg = redact(raw);
+
+  if (/429|quota|rate.?limit|RESOURCE_EXHAUSTED/i.test(msg)) {
+    return "Hit the Gemini rate limit or quota. Wait a minute and retry.";
+  }
+  if (/API key not valid|API_KEY_INVALID|400.*api.?key/i.test(msg)) {
+    return `Gemini rejected the API key. Check GEMINI_API_KEY is the full key, with no quotes or trailing spaces. (${msg})`;
+  }
+  if (/401|403|PERMISSION_DENIED|UNAUTHENTICATED/i.test(msg)) {
+    return `Gemini refused the request — the key may lack access to the Generative Language API, or the API isn't enabled on that project. (${msg})`;
+  }
+  if (/404|NOT_FOUND|is not found for API version|not supported/i.test(msg)) {
+    return `The model "${process.env.GEMINI_MODEL || "gemini-2.5-flash"}" wasn't found for this key. Set GEMINI_MODEL to a model your key can use. (${msg})`;
+  }
+  return `The analysis failed: ${msg}`;
+}
+
 export async function POST(req: NextRequest) {
   const ip = getClientIp(req);
   const rl = await checkRateLimit(ip);
@@ -105,7 +130,10 @@ export async function POST(req: NextRequest) {
         }
       } catch (err) {
         console.error("Gemini stream error:", err);
-        controller.enqueue(encoder.encode('\n{"kind":"error","text":"The analysis failed. If this keeps happening you may have hit the free-tier rate limit — wait a minute and retry."}\n{"kind":"done"}\n'));
+        // Report what actually went wrong. A blanket "rate limit" guess here
+        // hides auth, model-name and quota failures behind the wrong cause.
+        const detail = describeGeminiError(err);
+        controller.enqueue(encoder.encode("\n" + JSON.stringify({ kind: "error", text: detail }) + '\n{"kind":"done"}\n'));
       } finally {
         controller.close();
       }
