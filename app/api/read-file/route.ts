@@ -1,11 +1,11 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenAI } from "@google/genai";
 import { NextRequest, NextResponse } from "next/server";
 import { checkRateLimit, getClientIp } from "@/lib/ratelimit";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
+const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
 
 const IMAGE_TYPES = ["image/png", "image/jpeg", "image/jpg", "image/webp"];
 
@@ -45,16 +45,17 @@ export async function POST(req: NextRequest) {
     const base64 = bytes.toString("base64");
     const mimeType = isPdf ? "application/pdf" : (file.type || "image/png");
 
-    const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || "gemini-2.5-flash" });
-
     const prompt = `This file is an investment/mutual-fund account statement or a screenshot of a portfolio (for example from Groww, Zerodha, or a CAS). Extract the holdings as plain text. For each holding, output a line with: fund or stock name, units if shown, NAV/price if shown, and current value if shown. Keep it simple and faithful — do not invent anything. If you cannot find any holdings, reply with exactly: NO_HOLDINGS_FOUND.`;
 
-    const result = await model.generateContent([
-      { inlineData: { data: base64, mimeType } },
-      { text: prompt },
-    ]);
+    const result = await genAI.models.generateContent({
+      model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
+      contents: [
+        { inlineData: { data: base64, mimeType } },
+        { text: prompt },
+      ],
+    });
 
-    const text = (result.response.text() || "").trim();
+    const text = (result.text || "").trim();
 
     if (!text || text.includes("NO_HOLDINGS_FOUND") || text.length < 15) {
       return NextResponse.json(

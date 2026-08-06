@@ -1,11 +1,11 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenAI } from "@google/genai";
 import { NextRequest } from "next/server";
 import { checkRateLimit, getClientIp } from "@/lib/ratelimit";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
+const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
 
 type Holding = { name: string; type: string; value: string; weight: string };
 type ChatMsg = { role: "user" | "model"; text: string };
@@ -82,21 +82,20 @@ export async function POST(req: NextRequest) {
     async start(controller) {
       const encoder = new TextEncoder();
       try {
-        const model = genAI.getGenerativeModel({
-          model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
-          systemInstruction: buildSystemPrompt(body.context || {}),
-        });
-
         // All but the last message become history; the last is the new prompt.
         const history = messages.slice(0, -1).map((m) => ({
           role: m.role,
           parts: [{ text: m.text }],
         }));
 
-        const chat = model.startChat({ history });
-        const result = await chat.sendMessageStream(last.text);
-        for await (const chunk of result.stream) {
-          const t = chunk.text();
+        const chat = genAI.chats.create({
+          model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
+          config: { systemInstruction: buildSystemPrompt(body.context || {}) },
+          history,
+        });
+        const result = await chat.sendMessageStream({ message: last.text });
+        for await (const chunk of result) {
+          const t = chunk.text;
           if (t) controller.enqueue(encoder.encode(t));
         }
       } catch (err) {

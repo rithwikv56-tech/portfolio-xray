@@ -1,4 +1,4 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenAI } from "@google/genai";
 import { NextRequest } from "next/server";
 import { checkRateLimit, getClientIp } from "@/lib/ratelimit";
 
@@ -6,7 +6,7 @@ export const runtime = "nodejs";
 export const maxDuration = 60;
 
 // Uses Google Gemini's FREE tier (no credit card). Set GEMINI_API_KEY in .env.local.
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
+const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
 
 const SYSTEM_PROMPT = `You are a clear-eyed Indian portfolio analyst. A retail investor has given you their mutual fund / stock statement — often a messy Consolidated Account Statement (CAS) from CAMS/KFintech, a broker holding report (Zerodha, Groww, Upstox), or a fund-house statement. Tell them, in plain language, what they ACTUALLY own.
 
@@ -87,18 +87,20 @@ export async function POST(req: NextRequest) {
     async start(controller) {
       const encoder = new TextEncoder();
       try {
-        const model = genAI.getGenerativeModel({
+        const result = await genAI.models.generateContentStream({
           // Defaults to the confirmed free-tier model. To try the newer
           // gemini-3.5-flash (also free), set GEMINI_MODEL in .env.local.
           model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
-          systemInstruction: beginnerMode === true
-            ? SYSTEM_PROMPT + `\n\nIMPORTANT — BEGINNER MODE IS ON: This person is completely new to investing. Write every field as if explaining to a smart friend who has never invested: no financial terms at all without an instant everyday-words explanation, use simple analogies where they help, keep sentences short, and be extra warm and reassuring in tone. Never assume they know what equity, debt, NAV, or allocation mean — always say it in plain everyday words first.`
-            : SYSTEM_PROMPT,
+          contents: `Here is my statement:\n\n${trimmed}`,
+          config: {
+            systemInstruction: beginnerMode === true
+              ? SYSTEM_PROMPT + `\n\nIMPORTANT — BEGINNER MODE IS ON: This person is completely new to investing. Write every field as if explaining to a smart friend who has never invested: no financial terms at all without an instant everyday-words explanation, use simple analogies where they help, keep sentences short, and be extra warm and reassuring in tone. Never assume they know what equity, debt, NAV, or allocation mean — always say it in plain everyday words first.`
+              : SYSTEM_PROMPT,
+          },
         });
 
-        const result = await model.generateContentStream(`Here is my statement:\n\n${trimmed}`);
-        for await (const chunk of result.stream) {
-          const t = chunk.text();
+        for await (const chunk of result) {
+          const t = chunk.text;
           if (t) controller.enqueue(encoder.encode(t));
         }
       } catch (err) {
