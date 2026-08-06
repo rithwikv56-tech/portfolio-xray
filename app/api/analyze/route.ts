@@ -68,10 +68,14 @@ function redact(s: string): string {
 // and often a RetryInfo. Pull them out by pattern: the JSON body arrives embedded
 // in the SDK's message, so it isn't reliably parseable on its own.
 function extractQuotaInfo(raw: string): { quotaId?: string; quotaValue?: string; retryDelay?: string } {
+  // Gemini nests the real error as a JSON *string* inside the outer JSON, so the
+  // fields arrive double-escaped (\"quotaId\"). Unescape before matching, or the
+  // patterns silently miss and every 429 falls through to the generic branch.
+  const s = raw.replace(/\\"/g, '"').replace(/\\n/g, "\n");
   return {
-    quotaId: raw.match(/"quotaId"\s*:\s*"([^"]+)"/)?.[1],
-    quotaValue: raw.match(/"quotaValue"\s*:\s*"?(\d+)"?/)?.[1],
-    retryDelay: raw.match(/"retryDelay"\s*:\s*"([^"]+)"/)?.[1],
+    quotaId: s.match(/"quotaId"\s*:\s*"([^"]+)"/)?.[1],
+    quotaValue: s.match(/"quotaValue"\s*:\s*"?(\d+)"?/)?.[1],
+    retryDelay: s.match(/"retryDelay"\s*:\s*"([^"]+)"/)?.[1],
   };
 }
 
