@@ -64,13 +64,37 @@ function redact(s: string): string {
   return s.replace(/\b(AQ\.[A-Za-z0-9_-]+|AIza[A-Za-z0-9_-]+)/g, "[redacted]");
 }
 
+// A Gemini 429 carries a google.rpc.QuotaFailure (which limit, and its ceiling)
+// and often a RetryInfo. Pull them out by pattern: the JSON body arrives embedded
+// in the SDK's message, so it isn't reliably parseable on its own.
+function extractQuotaInfo(raw: string): { quotaId?: string; quotaValue?: string; retryDelay?: string } {
+  return {
+    quotaId: raw.match(/"quotaId"\s*:\s*"([^"]+)"/)?.[1],
+    quotaValue: raw.match(/"quotaValue"\s*:\s*"?(\d+)"?/)?.[1],
+    retryDelay: raw.match(/"retryDelay"\s*:\s*"([^"]+)"/)?.[1],
+  };
+}
+
 // Turn a Gemini failure into something that names the actual cause.
 function describeGeminiError(err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err);
   const msg = redact(raw);
 
   if (/429|quota|rate.?limit|RESOURCE_EXHAUSTED/i.test(msg)) {
-    return "Hit the Gemini rate limit or quota. Wait a minute and retry.";
+    const { quotaId, quotaValue, retryDelay } = extractQuotaInfo(msg);
+
+    // quotaValue 0 means the project has no allocation at all — never recovers.
+    if (quotaValue === "0") {
+      return "This API key's project has no Gemini quota at all, so waiting won't help. Keys made in the Google Cloud console often land on a project with no free-tier access — create a fresh key at aistudio.google.com/apikey and update GEMINI_API_KEY.";
+    }
+    if (quotaId && /PerDay/i.test(quotaId)) {
+      return `Daily Gemini quota used up. This resets at midnight Pacific — waiting a minute won't help. (${quotaId})`;
+    }
+    if (quotaId && /PerMinute/i.test(quotaId)) {
+      return `Per-minute Gemini rate limit hit${retryDelay ? ` — retry in ${retryDelay}` : ""}. Waiting about a minute will fix this.`;
+    }
+    // Shape we don't recognise: say what we saw rather than guess a cause.
+    return `Gemini returned a quota error${retryDelay ? ` (retry in ${retryDelay})` : ""}. If this fired on your first request rather than after repeated use, it's the project's quota, not a burst limit — check aistudio.google.com/apikey. (${msg})`;
   }
   if (/API key not valid|API_KEY_INVALID|400.*api.?key/i.test(msg)) {
     return `Gemini rejected the API key. Check GEMINI_API_KEY is the full key, with no quotes or trailing spaces. (${msg})`;
