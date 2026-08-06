@@ -1,6 +1,7 @@
 import { GoogleGenAI } from "@google/genai";
 import { NextRequest } from "next/server";
 import { checkRateLimit, getClientIp } from "@/lib/ratelimit";
+import { analyseOffline } from "@/lib/offline-analyze";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -19,6 +20,11 @@ const MODEL_CHAIN: string[] = (
   .map((m) => m.trim())
   .filter(Boolean)
   .filter((m, i, arr) => arr.indexOf(m) === i);
+
+// Set ANALYZE_OFFLINE=1 to bypass Gemini entirely and always serve the
+// deterministic analysis — useful when a demo must not depend on a quota.
+// With no API key there is nothing to call, so offline is the only option.
+const OFFLINE_ONLY = process.env.ANALYZE_OFFLINE === "1" || !process.env.GEMINI_API_KEY;
 
 const SYSTEM_PROMPT = `You are a clear-eyed Indian portfolio analyst. A retail investor has given you their mutual fund / stock statement — often a messy Consolidated Account Statement (CAS) from CAMS/KFintech, a broker holding report (Zerodha, Groww, Upstox), or a fund-house statement. Tell them, in plain language, what they ACTUALLY own.
 
@@ -91,14 +97,25 @@ function extractQuotaInfo(raw: string): { quotaId?: string; quotaValue?: string;
   };
 }
 
-// Quota/rate failures are the only ones worth retrying on a different model.
+// Quota/rate failures are worth retrying on a different model.
 function isQuotaError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return /429|RESOURCE_EXHAUSTED|quota|rate.?limit/i.test(msg);
 }
 
+// So is a model that this key can't reach — Google retires free-tier models and
+// closes them to new projects, which is a property of the model, not the request.
+function isModelUnavailable(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /404|NOT_FOUND|is not found for API version|no longer available|not supported/i.test(msg);
+}
+
+function shouldTryNextModel(err: unknown): boolean {
+  return isQuotaError(err) || isModelUnavailable(err);
+}
+
 // Turn a Gemini failure into something that names the actual cause.
-function describeGeminiError(err: unknown): string {
+function describeGeminiError(err: unknown, model?: string): string {
   const raw = err instanceof Error ? err.message : String(err);
   const msg = redact(raw);
 
@@ -125,7 +142,7 @@ function describeGeminiError(err: unknown): string {
     return `Gemini refused the request — the key may lack access to the Generative Language API, or the API isn't enabled on that project. (${msg})`;
   }
   if (/404|NOT_FOUND|is not found for API version|not supported/i.test(msg)) {
-    return `The model "${process.env.GEMINI_MODEL || "gemini-2.5-flash"}" wasn't found for this key. Set GEMINI_MODEL to a model your key can use. (${msg})`;
+    return `The model "${model || process.env.GEMINI_MODEL || "gemini-2.5-flash"}" wasn't found for this key. Set GEMINI_MODEL to a model your key can use. (${msg})`;
   }
   return `The analysis failed: ${msg}`;
 }
@@ -137,11 +154,7 @@ export async function POST(req: NextRequest) {
     return new Response(JSON.stringify({ error: rl.message }), { status: 429, headers: { "Content-Type": "application/json" } });
   }
 
-  if (!process.env.GEMINI_API_KEY) {
-    return new Response(JSON.stringify({ error: "The app isn't configured with a Gemini API key yet. Add GEMINI_API_KEY to .env.local." }), {
-      status: 500, headers: { "Content-Type": "application/json" },
-    });
-  }
+  // A missing key is no longer fatal — OFFLINE_ONLY picks up the analysis.
 
   let statementText: unknown;
   let beginnerMode: unknown;
@@ -165,9 +178,22 @@ export async function POST(req: NextRequest) {
       // exhausted key — try the next one instead of failing the request.
       let sentAnything = false;
       let lastErr: unknown = null;
+      let lastModel = MODEL_CHAIN[0];
+
+      const serveOffline = () => {
+        for (const line of analyseOffline(trimmed)) {
+          controller.enqueue(encoder.encode(JSON.stringify(line) + "\n"));
+        }
+      };
 
       try {
+        if (OFFLINE_ONLY) {
+          serveOffline();
+          return;
+        }
+
         for (const model of MODEL_CHAIN) {
+          lastModel = model;
           try {
             const result = await genAI.models.generateContentStream({
               model,
@@ -184,16 +210,23 @@ export async function POST(req: NextRequest) {
           } catch (err) {
             lastErr = err;
             console.error(`Gemini stream error (model ${model}):`, err);
-            // Once bytes are out we can't restart cleanly on another model, and
-            // a non-quota failure won't be fixed by switching. Stop either way.
-            if (sentAnything || !isQuotaError(err)) break;
-            console.error(`Model ${model} out of quota — falling back to the next model.`);
+            // Bytes already sent can't be restarted on another model. Otherwise
+            // retry only for reasons a different model could actually fix.
+            if (sentAnything || !shouldTryNextModel(err)) break;
+            console.error(`Model ${model} unusable — trying the next model in the chain.`);
           }
         }
 
         if (lastErr) {
-          const detail = describeGeminiError(lastErr);
-          controller.enqueue(encoder.encode("\n" + JSON.stringify({ kind: "error", text: detail }) + '\n{"kind":"done"}\n'));
+          if (sentAnything) {
+            // Mid-stream failure: the client already has partial JSONL, so a
+            // restart would corrupt it. Report instead.
+            const detail = describeGeminiError(lastErr, lastModel);
+            controller.enqueue(encoder.encode("\n" + JSON.stringify({ kind: "error", text: detail }) + '\n{"kind":"done"}\n'));
+          } else {
+            console.error("Every Gemini model failed — serving the offline analysis instead.");
+            serveOffline();
+          }
         }
       } finally {
         controller.close();
